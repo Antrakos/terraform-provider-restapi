@@ -116,6 +116,24 @@ func Provider() *schema.Provider {
 				DefaultFunc: schema.EnvDefaultFunc("REST_API_RATE_LIMIT", math.MaxFloat64),
 				Description: "Set this to limit the number of requests per second made to the API.",
 			},
+			"max_retries": {
+				Type:        schema.TypeInt,
+				Optional:    true,
+				DefaultFunc: schema.EnvDefaultFunc("REST_API_MAX_RETRIES", 0),
+				Description: "Maximum number of retries to attempt for failed requests. Retries are performed for rate limit errors (429), service unavailable errors (503), and network errors. Set to 0 to disable retries (default).",
+			},
+			"min_backoff": {
+				Type:        schema.TypeFloat,
+				Optional:    true,
+				DefaultFunc: schema.EnvDefaultFunc("REST_API_MIN_BACKOFF", 0.1),
+				Description: "Minimum seconds to wait between retries. Used as base for exponential backoff (default: 0.1 seconds).",
+			},
+			"max_backoff": {
+				Type:        schema.TypeFloat,
+				Optional:    true,
+				DefaultFunc: schema.EnvDefaultFunc("REST_API_MAX_BACKOFF", 30.0),
+				Description: "Maximum seconds to wait between retries when rate limited. The actual wait time may be less if the server provides a Retry-After header (default: 30 seconds).",
+			},
 			"test_path": {
 				Type:        schema.TypeString,
 				Optional:    true,
@@ -249,6 +267,9 @@ func configureProvider(d *schema.ResourceData) (interface{}, error) {
 		createReturnsObject: d.Get("create_returns_object").(bool),
 		xssiPrefix:          d.Get("xssi_prefix").(string),
 		rateLimit:           d.Get("rate_limit").(float64),
+		maxRetries:          d.Get("max_retries").(int),
+		minBackoff:          d.Get("min_backoff").(float64),
+		maxBackoff:          d.Get("max_backoff").(float64),
 		debug:               d.Get("debug").(bool),
 	}
 

@@ -12,7 +12,10 @@ require (
 	golang.org/x/time v0.3.0
 )
 
-require github.com/hashicorp/terraform-plugin-docs v0.16.0
+require (
+	github.com/cenkalti/backoff/v4 v4.3.0
+	github.com/hashicorp/terraform-plugin-docs v0.16.0
+)
 
 require (
 	github.com/Masterminds/goutils v1.1.1 // indirect

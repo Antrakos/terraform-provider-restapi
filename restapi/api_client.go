@@ -10,6 +10,8 @@ import (
 	"io"
 	"log"
 	"math"
+	"math/rand"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -17,10 +19,31 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/clientcredentials"
 	"golang.org/x/time/rate"
 )
+
+// Package-level PRNG for jitter calculation
+var rng = rand.New(rand.NewSource(time.Now().UnixNano()))
+
+// RetryExhaustedError wraps the final error after exhausting retries,
+// preserving HTTP status code and retry context
+type RetryExhaustedError struct {
+	LastError  error
+	RetryCount int
+	StatusCode int
+	Body       string
+}
+
+func (e *RetryExhaustedError) Error() string {
+	return fmt.Sprintf("%v (exhausted %d retries)", e.LastError, e.RetryCount)
+}
+
+func (e *RetryExhaustedError) Unwrap() error {
+	return e.LastError
+}
 
 type apiClientOpt struct {
 	uri                 string
@@ -43,6 +66,9 @@ type apiClientOpt struct {
 	xssiPrefix          string
 	useCookies          bool
 	rateLimit           float64
+	maxRetries          int
+	minBackoff          float64
+	maxBackoff          float64
 	oauthClientID       string
 	oauthClientSecret   string
 	oauthScopes         []string
@@ -78,6 +104,9 @@ type APIClient struct {
 	createReturnsObject bool
 	xssiPrefix          string
 	rateLimiter         *rate.Limiter
+	maxRetries          int
+	minBackoff          float64
+	maxBackoff          float64
 	debug               bool
 	oauthConfig         *clientcredentials.Config
 }
@@ -90,6 +119,19 @@ func NewAPIClient(opt *apiClientOpt) (*APIClient, error) {
 
 	if opt.uri == "" {
 		return nil, errors.New("uri must be set to construct an API client")
+	}
+
+	// Validate retry configuration
+	if opt.maxRetries > 0 {
+		if opt.minBackoff <= 0 {
+			return nil, fmt.Errorf("min_backoff must be positive when retries are enabled, got %f", opt.minBackoff)
+		}
+		if opt.maxBackoff <= 0 {
+			return nil, fmt.Errorf("max_backoff must be positive when retries are enabled, got %f", opt.maxBackoff)
+		}
+		if opt.minBackoff > opt.maxBackoff {
+			return nil, fmt.Errorf("min_backoff (%f) must be <= max_backoff (%f)", opt.minBackoff, opt.maxBackoff)
+		}
 	}
 
 	/* Sane default */
@@ -202,6 +244,9 @@ func NewAPIClient(opt *apiClientOpt) (*APIClient, error) {
 		writeReturnsObject:  opt.writeReturnsObject,
 		createReturnsObject: opt.createReturnsObject,
 		xssiPrefix:          opt.xssiPrefix,
+		maxRetries:          opt.maxRetries,
+		minBackoff:          opt.minBackoff,
+		maxBackoff:          opt.maxBackoff,
 		debug:               opt.debug,
 	}
 
@@ -242,6 +287,42 @@ func (client *APIClient) toString() string {
 	return buffer.String()
 }
 
+// httpResponse carries response data including headers for retry decisions
+type httpResponse struct {
+	statusCode int
+	body       string
+	headers    http.Header
+}
+
+// restapiBackoff implements the backoff.BackOff interface for retry logic
+type restapiBackoff struct {
+	retryCount, maxRetries int
+	backoffDuration        time.Duration
+}
+
+// NextBackOff returns the duration to wait before retrying the operation,
+// or backoff.Stop to indicate that no more retries should be made.
+func (r *restapiBackoff) NextBackOff() time.Duration {
+	if r.retryCount > r.maxRetries {
+		return backoff.Stop
+	}
+	return r.backoffDuration
+}
+
+// Reset to initial state.
+func (r *restapiBackoff) Reset() {}
+
+// isIdempotent returns true if the HTTP method is safe to retry
+func isIdempotent(method string) bool {
+	// Safe methods per RFC 7231
+	switch method {
+	case "GET", "HEAD", "OPTIONS", "PUT", "DELETE":
+		return true
+	default:
+		return false
+	}
+}
+
 /*
 Helper function that handles sending/receiving and handling
 
@@ -249,12 +330,128 @@ Helper function that handles sending/receiving and handling
 */
 func (client *APIClient) sendRequest(method string, path string, data string) (string, error) {
 	fullURI := client.uri + path
-	var req *http.Request
-	var err error
 
 	if client.debug {
 		log.Printf("api_client.go: method='%s', path='%s', full uri (derived)='%s', data='%s'\n", method, path, fullURI, data)
 	}
+
+	// If retries are disabled, use the original non-retry logic
+	if client.maxRetries <= 0 {
+		resp, err := client.doRequest(method, fullURI, data)
+		if resp != nil {
+			return resp.body, err
+		}
+		return "", err
+	}
+
+	// Retry logic enabled
+	var lastBody string
+	var lastErr error
+	var lastStatusCode int
+
+	bOff := &restapiBackoff{
+		maxRetries: client.maxRetries,
+	}
+
+	operation := func() error {
+		resp, err := client.doRequest(method, fullURI, data)
+		if resp != nil {
+			lastStatusCode = resp.statusCode
+		}
+		lastErr = err
+
+		if err != nil {
+			// Check if this method is safe to retry
+			if !isIdempotent(method) {
+				if client.debug {
+					log.Printf("api_client.go: Not retrying non-idempotent %s request\n", method)
+				}
+				return backoff.Permanent(err)
+			}
+
+			// Check if this is a retryable HTTP status code
+			if resp != nil && resp.statusCode == http.StatusTooManyRequests {
+				// Rate limit error - extract backoff time from Retry-After header
+				backoffDuration, found := Get429BackoffTime(resp.headers)
+				if !found {
+					// No valid header found, use min backoff
+					backoffDuration = time.Duration(client.minBackoff * float64(time.Second))
+				}
+				maxBackoffDuration := time.Duration(client.maxBackoff * float64(time.Second))
+				if backoffDuration > maxBackoffDuration {
+					backoffDuration = maxBackoffDuration
+				}
+				bOff.backoffDuration = backoffDuration
+				bOff.retryCount++
+
+				if client.debug {
+					log.Printf("api_client.go: Rate limited (429), retry %d/%d after %v\n", bOff.retryCount, client.maxRetries, backoffDuration)
+				}
+				return fmt.Errorf("rate limited, will retry")
+			}
+
+			if resp != nil && resp.statusCode == http.StatusServiceUnavailable {
+				// Service unavailable - use exponential backoff with jitter
+				backoffSeconds := math.Min(math.Pow(2, float64(bOff.retryCount))*client.minBackoff, client.maxBackoff)
+				// Add ±25% jitter to prevent thundering herd (75-125% of calculated backoff)
+				jitter := 0.75 + rng.Float64()*0.5
+				backoffSeconds = backoffSeconds * jitter
+				bOff.backoffDuration = time.Duration(backoffSeconds * float64(time.Second))
+				bOff.retryCount++
+				if client.debug {
+					log.Printf("api_client.go: Service unavailable (503), retry %d/%d after %v\n", bOff.retryCount, client.maxRetries, bOff.backoffDuration)
+				}
+				return fmt.Errorf("service unavailable, will retry")
+			}
+
+			var netErr net.Error
+			var urlErr *url.Error
+			if errors.Is(err, io.EOF) || errors.As(err, &netErr) || errors.As(err, &urlErr) {
+				backoffSeconds := math.Min(math.Pow(2, float64(bOff.retryCount))*client.minBackoff, client.maxBackoff)
+				// Add ±25% jitter to prevent thundering herd (75-125% of calculated backoff)
+				jitter := 0.75 + rng.Float64()*0.5
+				backoffSeconds = backoffSeconds * jitter
+				bOff.backoffDuration = time.Duration(backoffSeconds * float64(time.Second))
+				bOff.retryCount++
+
+				if client.debug {
+					log.Printf("api_client.go: Network error, retry %d/%d after %v: %v\n", bOff.retryCount, client.maxRetries, bOff.backoffDuration, err)
+				}
+				return fmt.Errorf("network error, will retry: %w", err)
+			}
+
+			// Non-retryable error
+			return backoff.Permanent(err)
+		}
+
+		// Success
+		if resp != nil {
+			lastBody = resp.body
+		}
+		return nil
+	}
+
+	err := backoff.Retry(operation, bOff)
+	if err != nil {
+		// Return custom error that preserves status code and retry context
+		if lastErr != nil {
+			return lastBody, &RetryExhaustedError{
+				LastError:  lastErr,
+				RetryCount: bOff.retryCount,
+				StatusCode: lastStatusCode,
+				Body:       lastBody,
+			}
+		}
+		return lastBody, err
+	}
+
+	return lastBody, nil
+}
+
+// doRequest performs a single HTTP request and returns response with headers
+func (client *APIClient) doRequest(method string, fullURI string, data string) (*httpResponse, error) {
+	var req *http.Request
+	var err error
 
 	buffer := bytes.NewBuffer([]byte(data))
 
@@ -270,8 +467,7 @@ func (client *APIClient) sendRequest(method string, path string, data string) (s
 	}
 
 	if err != nil {
-		log.Fatal(err)
-		return "", err
+		return nil, err
 	}
 
 	if client.debug {
@@ -290,7 +486,7 @@ func (client *APIClient) sendRequest(method string, path string, data string) (s
 		tokenSource := client.oauthConfig.TokenSource(ctx)
 		token, err := tokenSource.Token()
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 		req.Header.Set("Authorization", "Bearer "+token.AccessToken)
 	}
@@ -327,8 +523,7 @@ func (client *APIClient) sendRequest(method string, path string, data string) (s
 	resp, err := client.httpClient.Do(req)
 
 	if err != nil {
-		//log.Printf("api_client.go: Error detected: %s\n", err)
-		return "", err
+		return nil, err
 	}
 
 	if client.debug {
@@ -345,21 +540,26 @@ func (client *APIClient) sendRequest(method string, path string, data string) (s
 	resp.Body.Close()
 
 	if err2 != nil {
-		return "", err2
+		return nil, err2
 	}
 	body := strings.TrimPrefix(string(bodyBytes), client.xssiPrefix)
 	if client.debug {
 		log.Printf("api_client.go: BODY:\n%s\n", body)
 	}
 
+	httpResp := &httpResponse{
+		statusCode: resp.StatusCode,
+		body:       body,
+		headers:    resp.Header,
+	}
+
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return body, fmt.Errorf("unexpected response code '%d': %s", resp.StatusCode, body)
+		return httpResp, fmt.Errorf("unexpected response code '%d': %s", resp.StatusCode, body)
 	}
 
 	if body == "" {
-		return "{}", nil
+		httpResp.body = "{}"
 	}
 
-	return body, nil
-
+	return httpResp, nil
 }

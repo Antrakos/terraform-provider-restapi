@@ -50,6 +50,9 @@ provider "restapi" {
 - `insecure` (Boolean) When using https, this disables TLS verification of the host.
 - `key_file` (String) When set with the cert_file parameter, the provider will load a client certificate as a file for mTLS authentication. Note that this mechanism simply delegates to golang's tls.LoadX509KeyPair which does not support passphrase protected private keys. The most robust security protections available to the key_file are simple file system permissions.
 - `key_string` (String) When set with the cert_string parameter, the provider will load a client certificate as a string for mTLS authentication. Note that this mechanism simply delegates to golang's tls.LoadX509KeyPair which does not support passphrase protected private keys. The most robust security protections available to the key_file are simple file system permissions.
+- `max_backoff` (Number) Maximum seconds to wait between retries when rate limited. The actual wait time may be less if the server provides a Retry-After header (default: 30 seconds).
+- `max_retries` (Number) Maximum number of retries to attempt for failed requests. Retries are performed for rate limit errors (429), service unavailable errors (503), and network errors. Set to 0 to disable retries (default: 0).
+- `min_backoff` (Number) Minimum seconds to wait between retries. Used as base for exponential backoff. Supports floating point values (default: 0.1 seconds).
 - `oauth_client_credentials` (Block List, Max: 1) Configuration for oauth client credential flow using the https://pkg.go.dev/golang.org/x/oauth2 implementation (see [below for nested schema](#nestedblock--oauth_client_credentials))
 - `password` (String) When set, will use this password for BASIC auth to the API.
 - `rate_limit` (Number) Set this to limit the number of requests per second made to the API.
