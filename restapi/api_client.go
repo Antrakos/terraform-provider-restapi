@@ -312,17 +312,6 @@ func (r *restapiBackoff) NextBackOff() time.Duration {
 // Reset to initial state.
 func (r *restapiBackoff) Reset() {}
 
-// isIdempotent returns true if the HTTP method is safe to retry
-func isIdempotent(method string) bool {
-	// Safe methods per RFC 7231
-	switch method {
-	case "GET", "HEAD", "OPTIONS", "PUT", "DELETE":
-		return true
-	default:
-		return false
-	}
-}
-
 /*
 Helper function that handles sending/receiving and handling
 
@@ -361,14 +350,6 @@ func (client *APIClient) sendRequest(method string, path string, data string) (s
 		lastErr = err
 
 		if err != nil {
-			// Check if this method is safe to retry
-			if !isIdempotent(method) {
-				if client.debug {
-					log.Printf("api_client.go: Not retrying non-idempotent %s request\n", method)
-				}
-				return backoff.Permanent(err)
-			}
-
 			// Check if this is a retryable HTTP status code
 			if resp != nil && resp.statusCode == http.StatusTooManyRequests {
 				// Rate limit error - extract backoff time from Retry-After header
